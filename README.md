@@ -1,2 +1,2 @@
-# Lock_BarudakWell
-Aplikasi AppLock Untuk android
+# AppLocker
+Locked YT, FB dan TT
