@@ -100,6 +100,7 @@ class MainActivity : AppCompatActivity() {
                 prefs.edit()
                     .putLong("accumulated", 0L)
                     .putLong("lock_until", 0L)
+                    .putBoolean("counting", false)
                     .putBoolean("active", true)
                     .apply()
 
@@ -256,7 +257,11 @@ class MainActivity : AppCompatActivity() {
             val m = (remainingMs / 60000).toInt()
             val s = ((remainingMs % 60000) / 1000).toInt()
             val ms = (remainingMs % 1000).toInt()
-            tvUsage.text = "Waktu tersisa %02d:%02d:%03d dari %d menit".format(m, s, ms, offMinutes)
+            val status = if (prefs.getBoolean("counting", false))
+                "▶ Timer berjalan (aplikasi target sedang dibuka)"
+            else
+                "⏸ Timer berhenti (aplikasi target tidak dibuka)"
+            tvUsage.text = "Waktu tersisa %02d:%02d:%03d dari %d menit\n%s".format(m, s, ms, offMinutes, status)
         }
     }
 
@@ -282,6 +287,7 @@ class MainActivity : AppCompatActivity() {
                     // Nonaktifkan + reset semua timer
                     prefs.edit()
                         .putBoolean("active", false)
+                        .putBoolean("counting", false)
                         .putLong("accumulated", 0L)
                         .putLong("lock_until", 0L)
                         .apply()
@@ -328,6 +334,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // Jika mode aktif tapi service sempat mati (di-kill sistem / HP restart), hidupkan lagi.
+        // Aman dipanggil berulang: service yang sudah berjalan tidak dibuat ulang.
+        if (isActive()) startMonitorService()
         updateButton()
         updateControlsEnabled()
         updateUsageText()
