@@ -5,26 +5,34 @@ import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
+import android.provider.Settings
+import android.view.Gravity
+import android.view.View
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import java.util.concurrent.TimeUnit
 
 class MonitorService : Service() {
 
     private val handler = Handler(Looper.getMainLooper())
-
     private val prefs by lazy { getSharedPreferences("locker_prefs", MODE_PRIVATE) }
 
-    private var accumulatedMs = 0L
+    private var accumulatedMs = 0L      // total waktu pemakaian aplikasi target
     private var lockUntil = 0L
     private var lastTick = 0L
 
-    // Pelacakan aplikasi yang sedang di depan
+    // Pelacakan aplikasi yang sedang di layar depan
     private var foregroundPkg: String? = null
-    private var lastEventQuery = 0L
+    private var lastEventTime = 0L
+
+    private var lastLockLaunch = 0L
+    private var anchorView: View? = null
 
     private val tickRunnable = object : Runnable {
         override fun run() {
@@ -34,80 +42,130 @@ class MonitorService : Service() {
             }
 
             val now = System.currentTimeMillis()
+            val tickNow = SystemClock.elapsedRealtime()
+            val delta = (tickNow - lastTick).coerceIn(0L, 3000L)
+            lastTick = tickNow
 
-            // Masih dalam masa kunci
-            if (now < lockUntil) {
-                checkAndShowLock()
-                handler.postDelayed(this, 1000)
-                return
+            try {
+                updateForegroundPackage()
+            } catch (e: Exception) {
+                // abaikan, pakai data terakhir
             }
 
-            // Timer berjalan terus selama mode aktif
-            val currentTick = SystemClock.elapsedRealtime()
-            if (lastTick > 0) {
-                val elapsed = currentTick - lastTick
-                if (elapsed in 1..5000) {
-                    accumulatedMs += elapsed
-                    prefs.edit().putLong("accumulated", accumulatedMs).apply()
+            val targets = AppStore.lockedPackages(prefs)
+            val pkg = foregroundPkg
+            val inTarget = isScreenOn() && pkg != null && targets.contains(pkg)
+
+            if (now < lockUntil) {
+                // ---- MASA KUNCI: timer tidak berjalan, target yang dibuka langsung ditutup layar kunci
+                if (inTarget) showLock(now)
+                prefs.edit().putBoolean("counting", false).apply()
+            } else {
+                // ---- MASA BOLEH PAKAI: timer hanya berjalan saat aplikasi target dibuka
+                if (inTarget) {
+                    accumulatedMs += delta
+                }
+
+                val offMinutes = prefs.getInt("off_minutes", 20)
+                val limitMs = TimeUnit.MINUTES.toMillis(offMinutes.toLong())
+
+                if (accumulatedMs >= limitMs) {
+                    val waitMinutes = prefs.getInt("wait_minutes", 15)
+                    lockUntil = now + TimeUnit.MINUTES.toMillis(waitMinutes.toLong())
+                    accumulatedMs = 0L
+                    prefs.edit()
+                        .putLong("lock_until", lockUntil)
+                        .putLong("accumulated", 0L)
+                        .putBoolean("counting", false)
+                        .apply()
+                    showLock(now)
+                } else {
+                    prefs.edit()
+                        .putLong("accumulated", accumulatedMs)
+                        .putBoolean("counting", inTarget)
+                        .apply()
                 }
             }
-            lastTick = currentTick
 
-            val offMinutes = prefs.getInt("off_minutes", 20)
-            val limitMs = TimeUnit.MINUTES.toMillis(offMinutes.toLong())
-
-            if (accumulatedMs >= limitMs) {
-                val waitMinutes = prefs.getInt("wait_minutes", 15)
-                lockUntil = now + TimeUnit.MINUTES.toMillis(waitMinutes.toLong())
-                accumulatedMs = 0L
-                prefs.edit()
-                    .putLong("lock_until", lockUntil)
-                    .putLong("accumulated", 0L)
-                    .apply()
-                checkAndShowLock()
-            }
-
-            handler.postDelayed(this, 500) // update setiap 0.5 detik
+            handler.postDelayed(this, 500)
         }
     }
 
     /**
-     * Membaca event penggunaan sejak pengecekan terakhir dan mencatat
-     * aplikasi terakhir yang masuk ke layar depan (ACTIVITY_RESUMED).
-     * Cara ini lebih akurat daripada queryUsageStats + lastTimeUsed.
+     * Membaca event penggunaan sejak pengecekan terakhir:
+     * - ACTIVITY_RESUMED  -> aplikasi itu sekarang di depan
+     * - ACTIVITY_PAUSED   -> kalau itu aplikasi yang di depan, berarti tidak ada lagi (mis. layar mati)
      */
     private fun updateForegroundPackage() {
         val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
         val now = System.currentTimeMillis()
-        // Pertama kali: lihat 1 jam ke belakang. Berikutnya: sejak pengecekan terakhir (+2 dtk overlap)
-        val from = if (lastEventQuery == 0L) now - TimeUnit.HOURS.toMillis(1) else lastEventQuery - 2000
+        val from = if (lastEventTime == 0L) now - TimeUnit.HOURS.toMillis(6) else lastEventTime
         val events = usm.queryEvents(from, now)
-        val event = UsageEvents.Event()
+        val e = UsageEvents.Event()
         while (events.hasNextEvent()) {
-            events.getNextEvent(event)
-            if (event.eventType == UsageEvents.Event.ACTIVITY_RESUMED) {
-                foregroundPkg = event.packageName
+            events.getNextEvent(e)
+            if (e.timeStamp > lastEventTime) lastEventTime = e.timeStamp
+            when (e.eventType) {
+                UsageEvents.Event.ACTIVITY_RESUMED -> foregroundPkg = e.packageName
+                UsageEvents.Event.ACTIVITY_PAUSED ->
+                    if (e.packageName == foregroundPkg) foregroundPkg = null
             }
         }
-        lastEventQuery = now
     }
 
-    private fun checkAndShowLock() {
-        try {
-            updateForegroundPackage()
-            val pkg = foregroundPkg ?: return
+    private fun isScreenOn(): Boolean {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        return pm.isInteractive
+    }
 
-            // Daftar dibaca setiap kali, jadi perubahan centang langsung berlaku
-            val targets = AppStore.lockedPackages(prefs)
-            if (targets.contains(pkg)) {
-                val intent = Intent(this, LockActivity::class.java).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                }
-                startActivity(intent)
+    private fun showLock(now: Long) {
+        // Jangan menembakkan activity berkali-kali dalam waktu singkat
+        if (now - lastLockLaunch < 1500) return
+        lastLockLaunch = now
+        try {
+            val intent = Intent(this, LockActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+
+    /**
+     * Jendela overlay 1x1 piksel yang tidak terlihat. Dengan adanya jendela overlay yang aktif,
+     * Android (terutama versi baru) lebih mengizinkan service membuka LockActivity dari latar belakang.
+     */
+    private fun addAnchorOverlay() {
+        try {
+            if (!Settings.canDrawOverlays(this) || anchorView != null) return
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val v = View(this)
+            val lp = WindowManager.LayoutParams(
+                1, 1,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.START or Gravity.TOP
+            wm.addView(v, lp)
+            anchorView = v
+        } catch (e: Exception) {
+            // ignore
+        }
+    }
+
+    private fun removeAnchorOverlay() {
+        try {
+            anchorView?.let {
+                val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                wm.removeView(it)
             }
         } catch (e: Exception) {
             // ignore
         }
+        anchorView = null
     }
 
     override fun onCreate() {
@@ -119,7 +177,13 @@ class MonitorService : Service() {
         accumulatedMs = prefs.getLong("accumulated", 0)
         lastTick = SystemClock.elapsedRealtime()
 
+        addAnchorOverlay()
         handler.post(tickRunnable)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Dipanggil lagi saat MainActivity / BootReceiver menyalakan service; aman diulang.
+        return START_STICKY
     }
 
     private fun createNotificationChannel() {
@@ -134,7 +198,7 @@ class MonitorService : Service() {
     private fun createNotification(): Notification {
         return NotificationCompat.Builder(this, "monitor")
             .setContentTitle("App Locker aktif")
-            .setContentText("Timer sedang berjalan")
+            .setContentText("Timer berjalan saat aplikasi target dibuka")
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setOngoing(true)
             .build()
@@ -144,6 +208,8 @@ class MonitorService : Service() {
 
     override fun onDestroy() {
         handler.removeCallbacks(tickRunnable)
+        removeAnchorOverlay()
+        prefs.edit().putBoolean("counting", false).apply()
         super.onDestroy()
     }
 }
